@@ -1,216 +1,253 @@
 import random
 import time
+import logging
+import re
+from typing import List, Set
+
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
-from oauth2client.service_account import ServiceAccountCredentials
 import gspread
-import gspread.exceptions
-from settings import *
+from oauth2client.service_account import ServiceAccountCredentials
+from gspread.exceptions import WorksheetNotFound
+
+from settings import *  # GOOGLE_CREDS_PATH, SPREADSHEET_KEY, ZAKUP_KONTUR_LOGIN, ZAKUP_KONTUR_PASS
+
+# -------------------------------
+# Логирование
+# -------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
-# ---- Класс для работы с Google Sheets ----
-class GoogleSheet:
-    def __init__(self, json_file, spreadsheet_key, sheet_name="Kontur"):
+# -------------------------------
+# Google Sheets Helper
+# -------------------------------
+class GoogleSheetClient:
+    HEADERS = ["ID тендера", "Название платформы", "Тип торгов", "Способ отбора",
+               "Название", "Описание", "Организатор", "Ссылка", "Дата публикации", "Дата окончания"]
+
+    def __init__(self, creds_path: str, spreadsheet_key: str, worksheet_name: str = "Tenders"):
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(json_file, scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
         client = gspread.authorize(creds)
-        self.sheet = self._get_sheet(client, spreadsheet_key, sheet_name)
-        self.existing_ids = set(self.sheet.col_values(1))  # для проверки дубликатов
+        self.spreadsheet = client.open_by_key(spreadsheet_key)
 
-    def _get_sheet(self, client, key, sheet_name):
-        spreadsheet = client.open_by_key(key)
         try:
-            sheet = spreadsheet.worksheet(sheet_name)
-        except gspread.exceptions.WorksheetNotFound:
-            sheet = spreadsheet.add_worksheet(title=sheet_name, rows=2000, cols=10)
-        if not sheet.row_values(1):
-            headers = ["ID тендера", "Название", "Описание", "Организатор", "Ссылка", "Дата публикации", "Дата окончания"]
-            sheet.append_row(headers)
-        return sheet
+            self.sheet = self.spreadsheet.worksheet(worksheet_name)
+            logger.info(f"Используем существующий лист: {worksheet_name}")
+        except WorksheetNotFound:
+            self.sheet = self.spreadsheet.add_worksheet(title=worksheet_name, rows=2000, cols=10)
+            logger.info(f"Создан новый лист: {worksheet_name}")
 
-    def append_rows(self, rows):
-        rows_to_add = []
-        for row in rows:
-            if row[0] not in self.existing_ids:
-                rows_to_add.append(row)
-                self.existing_ids.add(row[0])
-        if rows_to_add:
-            self.sheet.append_rows(rows_to_add, value_input_option="RAW")
-            for r in rows_to_add:
-                print("Сохранено:", r)
+        if not self.sheet.row_values(1):
+            self.sheet.append_row(self.HEADERS)
+            logger.info("Добавлены заголовки в Google Sheets")
+
+    def append_row(self, row: List[str]):
+        try:
+            self.sheet.append_rows([row], value_input_option="RAW")
+            logger.info(f"Сохранено в Google Sheets: {row}")
+        except Exception as e:
+            logger.error(f"Ошибка при добавлении строки в Google Sheets: {e}")
 
 
-# ---- Класс для хранения данных о тендере ----
-class Tender:
-    def __init__(self, platform_id, name, status, organizer, link, publish_date, deadline):
-        self.platform_id = platform_id
-        self.name = name
-        self.status = status
-        self.organizer = organizer
-        self.link = link
-        self.publish_date = publish_date
-        self.deadline = deadline
-
-    def to_row(self):
-        return [
-            self.platform_id,
-            self.name,
-            self.status,
-            self.organizer,
-            self.link,
-            self.publish_date,
-            self.deadline
-        ]
-
-
-# ---- Класс для скрапинга контента с Kontur ----
+# -------------------------------
+# Scraper
+# -------------------------------
 class KonturScraper:
-    def __init__(self, email, password, keywords, sheet: GoogleSheet):
-        self.email = email
-        self.password = password
+    PLATFORM_NAME = "Контур"
+
+    def __init__(self, sheet_client: GoogleSheetClient, keywords: List[str]):
+        self.sheet = sheet_client
         self.keywords = [kw.lower() for kw in keywords]
-        self.sheet = sheet
-        self.driver = None
+        self.seen_links: Set[str] = set()
 
-    def start(self):
-        self.driver = uc.Chrome(version_main=139)
-        self.driver.maximize_window()
-        self.driver.get("https://zakupki.kontur.ru/Login")
-        self.login()
-        self.set_checkboxes()
-        self.find_tenders()
-        self.driver.quit()
+    def init_driver(self):
+        driver = uc.Chrome()
+        driver.maximize_window()
+        return driver
 
-    def login(self):
+    def login(self, driver):
+        driver.get("https://zakupki.kontur.ru/Login")
         try:
-            input_login = WebDriverWait(self.driver, 20).until(
+            input_login = WebDriverWait(driver, 20).until(
                 EC.presence_of_element_located((By.XPATH, '//*[@id="email"]'))
             )
             time.sleep(random.randint(2, 3))
-            input_login.send_keys(self.email)
+            input_login.send_keys(ZAKUP_KONTUR_LOGIN)
 
-            input_pass = WebDriverWait(self.driver, 20).until(
+            input_pass = WebDriverWait(driver, 20).until(
                 EC.presence_of_element_located((By.XPATH, '//*[@id="password"]'))
             )
             time.sleep(random.randint(2, 3))
-            input_pass.send_keys(self.password)
+            input_pass.send_keys(ZAKUP_KONTUR_PASS)
 
-            click_log_but = WebDriverWait(self.driver, 20).until(
+            click_log_but = WebDriverWait(driver, 20).until(
                 EC.element_to_be_clickable((By.XPATH, '//div[@data-tid="btn-login"]'))
             )
             time.sleep(2)
             click_log_but.click()
+            logger.info("Успешный вход в систему")
             time.sleep(7.5)
         except Exception as e:
-            print(f"ERROR LOGIN {e}")
+            logger.error(f"Ошибка при логине: {e}")
 
-    def set_checkboxes(self):
-        checkbox_ids = ["Работакомиссии", "Завершены", "Планируются", "Отменены"]
-        for cid in checkbox_ids:
+    def set_filters(self, driver):
+        checkbox_xpaths = {
+            "commis": '//div[@id="Работакомиссии"]//label[@data-tid="Checkbox__root"]',
+            "ends": '//div[@id="Завершены"]//label[@data-tid="Checkbox__root"]',
+            "plans": '//div[@id="Планируются"]//label[@data-tid="Checkbox__root"]',
+            "passed": '//div[@id="Отменены"]//label[@data-tid="Checkbox__root"]'
+        }
+
+        for name, xpath in checkbox_xpaths.items():
             try:
-                click_checkbox = WebDriverWait(self.driver, 20).until(
-                    EC.element_to_be_clickable((By.XPATH, f'//div[@id="{cid}"]//label[@data-tid="Checkbox__root"]'))
-                )
+                el = WebDriverWait(driver, 20).until(EC.element_to_be_clickable((By.XPATH, xpath)))
                 time.sleep(1)
-                click_checkbox.click()
+                el.click()
+                logger.info(f"Выбран фильтр: {name}")
             except Exception as e:
-                print(f"ERROR {cid} CHECKBOX {e}")
+                logger.warning(f"Не удалось выбрать фильтр {name}: {e}")
 
+        # Нажимаем поиск
         try:
-            click_find = WebDriverWait(self.driver, 20).until(
+            click_find = WebDriverWait(driver, 20).until(
                 EC.element_to_be_clickable((By.XPATH, '//span[@data-tid="find_button"]'))
             )
             time.sleep(1)
             click_find.click()
+            logger.info("Поиск запущен")
+            time.sleep(4)
         except Exception as e:
-            print(f'ERROR FIND BUTTON {e}')
+            logger.error(f"Ошибка при клике поиска: {e}")
 
-        time.sleep(4)
-
-    def find_tenders(self):
+    def collect_links(self, driver) -> List[str]:
+        all_links = []
         page = 0
+
         while True:
             page += 1
-            print(f"PAGE NUM {page}")
+            logger.info(f"Сбор ссылок, страница {page}")
             time.sleep(4)
-            page_src = self.driver.page_source
-            soup = BeautifulSoup(page_src, "html.parser")
-            rows_to_write = []
-
+            soup = BeautifulSoup(driver.page_source, "html.parser")
             try:
                 cards = soup.find_all("div", class_="purchase-card")
                 for card in cards:
-                    tender = self.parse_card(card)
-                    text_to_check = " ".join([tender.name or "", tender.status or "", tender.organizer or ""]).lower()
-                    if any(kw in text_to_check for kw in self.keywords):
-                        rows_to_write.append(tender.to_row())
+                    try:
+                        link_tag = card.select_one("a.purchase-card__order-name")
+                        if not link_tag or not link_tag.get("href"):
+                            continue
+                        card_text = card.get_text(" ", strip=True).lower()
+                        if any(kw in card_text for kw in self.keywords):
+                            href = link_tag["href"]
+                            if href not in self.seen_links:
+                                all_links.append(href)
+                                self.seen_links.add(href)
+                    except Exception as inner_e:
+                        logger.warning(f"Ошибка обработки карточки: {inner_e}")
             except Exception as e:
-                print(f"ERROR GET CARDS {e}")
-
-            self.sheet.append_rows(rows_to_write)
+                logger.error(f"Ошибка при сборе ссылок: {e}")
 
             # Переход на следующую страницу
             try:
-                find_next_page = WebDriverWait(self.driver, 5).until(
+                next_btn = WebDriverWait(driver, 5).until(
                     EC.element_to_be_clickable((By.XPATH, '//a[@class="paging-link custom-paging__next"]'))
                 )
-                find_next_page.click()
-            except:
+                logger.info("Переходим на следующую страницу")
+                next_btn.click()
+            except Exception:
                 break
 
-    @staticmethod
-    def parse_card(card):
-        platform_id = card.get("data-card")
-        notif = card.find("div", class_="purchase-card__notification-info")
-        reg_number = None
-        if notif:
-            spans = notif.find_all("span")
-            publish_date_tag = notif.find("span", class_="purchase-card__publish-date")
-            for sp in spans:
-                if "sng-label" in sp.get("class", []):
-                    continue
-                if sp == publish_date_tag:
-                    continue
-                reg_number = sp.get_text(strip=True)
+        logger.info(f"Всего ссылок собрано: {len(all_links)}")
+        return all_links
 
-        name_tag = card.select_one("a.purchase-card__order-name span")
-        name = name_tag.get_text(strip=True) if name_tag else None
+    def parse_and_save(self, driver, links: List[str]):
+        for link in links:
+            try:
+                driver.get(link)
+                time.sleep(2)
+                soup = BeautifulSoup(driver.page_source, "html.parser")
+                data = {}
 
-        link_tag = card.select_one("a.purchase-card__order-name")
-        link = link_tag["href"] if link_tag else None
+                data["platform_id"] = link.rstrip("/").split("/")[-1]
+                data["link"] = link
+                data["name"] = (soup.select_one("h1.tender-block__title").get_text(strip=True)
+                                if soup.select_one("h1.tender-block__title") else "--")
+                data["selection_method"] = (soup.select_one("div.purchase-type__title").get_text(strip=True)
+                                            if soup.select_one("div.purchase-type__title") else "--")
+                data["type"] = (soup.select_one(".purchase-page__block.tender-block.purchase-placement .tender-named-values_value")
+                                .get_text(" ", strip=True) if soup.select_one(
+                                    ".purchase-page__block.tender-block.purchase-placement .tender-named-values_value") else "--")
+                data["description"] = (soup.select_one("div.purchase-description__publication-info").get_text(" ", strip=True)
+                                       if soup.select_one("div.purchase-description__publication-info") else "--")
+                data["organizer"] = (soup.select_one("div.lot-customer__info").get_text(" ", strip=True)
+                                     if soup.select_one("div.lot-customer__info") else "--")
+                # Дата публикации
+                pub_tag = soup.select_one("div.purchase-description__publication-info")
+                if pub_tag:
+                    match = re.search(r"опубликован\s+([\d\.]+\s[\d:]+)", pub_tag.get_text(" ", strip=True))
+                    data["publish_date"] = match.group(1) if match else "--"
+                else:
+                    data["publish_date"] = "--"
+                # Дата окончания
+                date_tag = soup.select_one("span[data-tid='p-date__date']")
+                data["deadline"] = date_tag.get_text(strip=True) if date_tag else "--"
 
-        status_tag = card.select_one(".purchase-card__status-col span")
-        status = status_tag.get_text(" ", strip=True) if status_tag else None
+                row = [
+                    data["platform_id"],
+                    self.PLATFORM_NAME,
+                    data.get("type", "--"),
+                    data.get("selection_method", "--"),
+                    data["name"],
+                    data["description"],
+                    data["organizer"],
+                    data["link"],
+                    data["publish_date"],
+                    data["deadline"],
+                ]
 
-        pub_tag = card.select_one("span.purchase-card__publish-date")
-        publish_date = pub_tag.get_text(strip=True).replace("от ", "") if pub_tag else None
+                self.sheet.append_row(row)
+            except Exception as e:
+                logger.error(f"Ошибка при обработке ссылки {link}: {e}")
 
-        deadline_tag = card.select_one(".purchase-card__status-col span")
-        deadline = None
-        if deadline_tag and "до" in deadline_tag.text:
-            txt = deadline_tag.get_text(" ", strip=True)
-            parts = txt.split("до")
-            if len(parts) > 1:
-                deadline = parts[1].strip()
-
-        org_tag = card.find("p", class_="purchase-card__customer")
-        if org_tag:
-            organizer = org_tag.get_text(strip=True)
-        else:
-            ep_link = card.select_one("span.purchase-card__ep a")
-            organizer = ep_link.get_text(" ", strip=True) if ep_link else None
-
-        return Tender(platform_id, name, status, organizer, link, publish_date, deadline)
+    def run(self):
+        driver = self.init_driver()
+        try:
+            self.login(driver)
+            self.set_filters(driver)
+            links = self.collect_links(driver)
+            self.parse_and_save(driver, links)
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
-# ---- MAIN ----
+# -------------------------------
+# Загрузка ключевых слов
+# -------------------------------
+def load_keywords(path: str = "../keywords.txt") -> List[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return [line.strip().lower() for line in f if line.strip()]
+    except Exception as e:
+        logger.error(f"Не удалось загрузить keywords: {e}")
+        return []
+
+
+# -------------------------------
+# Запуск
+# -------------------------------
 if __name__ == "__main__":
-    with open("../keywords.txt", "r", encoding="utf-8") as f:
-        keywords = [line.strip() for line in f if line.strip()]
-
-    sheet = GoogleSheet(GOOGLE_CREDS_PATH, SPREADSHEET_KEY)
-    scraper = KonturScraper(ZAKUP_KONTUR_LOGIN, ZAKUP_KONTUR_PASS, keywords, sheet)
-    scraper.start()
+    keywords = load_keywords("../keywords.txt")
+    sheet_client = GoogleSheetClient(GOOGLE_CREDS_PATH, SPREADSHEET_KEY)
+    scraper = KonturScraper(sheet_client, keywords)
+    scraper.run()
