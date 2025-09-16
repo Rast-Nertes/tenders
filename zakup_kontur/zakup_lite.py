@@ -10,21 +10,22 @@ from settings import *
 from oauth2client.service_account import ServiceAccountCredentials
 import gspread.exceptions
 
+platform_z = "Контур"
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name(
-    "../tenders-471321-0956d325050a.json", scope
+    GOOGLE_CREDS_PATH, scope
 )
 client = gspread.authorize(creds)
-spreadsheet = client.open_by_key("1smGDKdadXigDZ79QvChQH9LIY85BtsjvTBiCOLgLIS0")
+spreadsheet = client.open_by_key(SPREADSHEET_KEY)
 sheet_main = spreadsheet.sheet1   # "Tenders"
 
 try:
-    sheet_kontur = spreadsheet.worksheet("Kontur")
+    sheet_kontur = spreadsheet.worksheet("Tenders")
 except gspread.exceptions.WorksheetNotFound:
     sheet_kontur = spreadsheet.add_worksheet(title="Kontur", rows=2000, cols=10)
 
 if not sheet_kontur.row_values(1):
-    headers = ["ID тендера", "Название", "Описание", "Организатор", "Ссылка", "Дата публикации", "Дата окончания"]
+    headers = ["ID тендера", "Название платформы", "Тип торгов", "Способ отбора", "Название", "Описание", "Организатор", "Ссылка", "Дата публикации", "Дата окончания"]
     sheet_kontur.append_row(headers)
 
 
@@ -33,7 +34,7 @@ with open("../keywords.txt", "r", encoding="utf-8") as f:
 
 
 def init_driver():
-    driver = uc.Chrome(version_main=139)
+    driver = uc.Chrome()
     driver.maximize_window()
     driver.get("https://zakupki.kontur.ru/Login")
 
@@ -112,125 +113,149 @@ def init_driver():
 
     time.sleep(4)
 
+    all_links = []
+    seen_links = set()
+
     try:
         page = 0
         while True:
+            page += 1
+            print(f"PAGE NUM {page} \n")
+            time.sleep(4)
+            page_src = driver.page_source
+            soup = BeautifulSoup(page_src, "html.parser")  # явный парсер
+
+            try:
+                # Сбор всех ссылок на тендеры — теперь с фильтрацией по ключевым словам (по всему тексту карточки)
+                cards = soup.find_all("div", class_="purchase-card")
+                for card in cards:
+                    try:
+                        link_tag = card.select_one("a.purchase-card__order-name")
+                        if not link_tag or not link_tag.get("href"):
+                            continue
+
+                        # Берём весь текст карточки и приводим к lower для сравнения с keywords
+                        card_text = card.get_text(" ", strip=True).lower()
+
+                        # если хоть одно ключевое слово совпало — добавляем ссылку
+                        if any(kw in card_text for kw in keywords):
+                            href = link_tag["href"]
+                            if href not in seen_links:
+                                all_links.append(href)
+                                seen_links.add(href)
+                    except Exception as inner_e:
+                        # локально логируем проблему с отдельной карточкой и продолжаем
+                        print(f"ERROR PROCESS CARD: {inner_e}")
+                        continue
+            except Exception as e:
+                print(f'ERROR GET LINKS {e}')
+
             try:
                 find_next_page = WebDriverWait(driver, 5).until(
                     EC.element_to_be_clickable((By.XPATH, '//a[@class="paging-link custom-paging__next"]'))
                 )
                 print(f"NEXT BUT FIND!")
-            except:
-                break
-
-            page += 1
-            print(f"PAGE NUM {page} \n")
-            time.sleep(4)
-            page_src = driver.page_source
-            soup = BeautifulSoup(page_src)
-
-            results = []
-            rows_to_write = []
-            try:
-                cards = soup.find_all("div", class_="purchase-card")
-                for card in cards:
-                    data = {}
-
-                    # 1. идентификатор тендера на площадке-источнике
-                    data["platform_id"] = card.get("data-card")
-
-                    # 2. Регистрационный номер (внутри блока notification-info)
-                    notif = card.find("div", class_="purchase-card__notification-info")
-                    reg_number = None
-
-                    if notif:
-                        spans = notif.find_all("span")
-                        publish_date_tag = notif.find("span", class_="purchase-card__publish-date")
-
-                        for sp in spans:
-                            # пропускаем "Казахстан" и дату
-                            if "sng-label" in sp.get("class", []):
-                                continue
-                            if sp == publish_date_tag:
-                                continue
-                            reg_number = sp.get_text(strip=True)
-
-                    data["reg_number"] = reg_number
-
-                    # 3. Наименование тендера
-                    name_tag = card.select_one("a.purchase-card__order-name span")
-                    data["name"] = name_tag.get_text(strip=True) if name_tag else None
-
-                    # 4. Ссылка на тендер (основная)
-                    link_tag = card.select_one("a.purchase-card__order-name")
-                    data["link"] = link_tag["href"] if link_tag else None
-
-                    # 5. Статус тендера
-                    status_tag = card.select_one(".purchase-card__status-col span")
-                    data["status"] = status_tag.get_text(" ", strip=True) if status_tag else None
-
-                    # 6. Дата публикации
-                    pub_tag = card.select_one("span.purchase-card__publish-date")
-                    data["publish_date"] = (
-                        pub_tag.get_text(strip=True).replace("от ", "") if pub_tag else None
-                    )
-
-                    # 7. Дата окончания подачи заявок
-                    deadline_tag = card.select_one(".purchase-card__status-col span")
-                    deadline = None
-                    if deadline_tag and "до" in deadline_tag.text:
-                        # пример: "Подача заявок до 09.09.2025 11:00 МСК"
-                        txt = deadline_tag.get_text(" ", strip=True)
-                        parts = txt.split("до")
-                        if len(parts) > 1:
-                            deadline = parts[1].strip()
-                    data["deadline"] = deadline
-
-                    # 8. Организатор — сначала p.purchase-card__customer, иначе span.purchase-card__ep a
-                    org = None
-                    org_tag = card.find("p", class_="purchase-card__customer")
-                    if org_tag:
-                        org = org_tag.get_text(strip=True)
-                    else:
-                        ep_link = card.select_one("span.purchase-card__ep a")
-                        if ep_link:
-                            org = ep_link.get_text(" ", strip=True)
-                    data["organizer"] = org
-
-                    # ---- фильтрация ----
-
-                    text_to_check = " ".join([
-                        data.get("name") or "",
-                        data.get("status") or "",
-                        data.get("organizer") or "",
-                    ]).lower()
-
-                    if any(kw in text_to_check for kw in keywords):
-                        row = [
-                            data.get("platform_id", ""),
-                            data.get("name", ""),
-                            data.get("status", ""),
-                            data.get("organizer", ""),
-                            data.get("link", ""),
-                            data.get("publish_date", ""),
-                            data.get("deadline", ""),
-                        ]
-                        rows_to_write.append(row)
-                        results.append(data)
-
-                if rows_to_write:
-                    sheet_kontur.append_rows(rows_to_write, value_input_option="RAW")
-
-                for r in rows_to_write:
-                    print("Сохранено:", r)
-
-            except Exception as e:
-                print(f"ERROR GET CARDS {e}")
-
-            try:
                 find_next_page.click()
             except:
-                ...
+                break
+        print(f"Всего ссылок собрано: {len(all_links)}")
+
+        for link in all_links:
+            try:
+                driver.get(link)
+                time.sleep(2)
+                soup = BeautifulSoup(driver.page_source, "html.parser")
+
+                data = {}
+
+                # ID тендера
+                try:
+                    data["platform_id"] = link.rstrip("/").split("/")[-1]
+                except:
+                    data["platform_id"] = "--"
+
+                # Ссылка
+                try:
+                    data["link"] = link
+                except:
+                    data["link"] = "--"
+
+                # Название
+                try:
+                    name_tag = soup.select_one("h1.tender-block__title")
+                    data["name"] = name_tag.get_text(strip=True) if name_tag else "--"
+                except:
+                    data["name"] = "--"
+
+                try:
+                    type_tag = soup.select_one("div.purchase-type__title")
+                    data["selection_method"] = type_tag.get_text(strip=True) if type_tag else "--"
+                except:
+                    data["selection_method"] = "--"
+
+                # Тип торгов
+                try:
+                    # Выбираем первый элемент в блоке "purchase-placement"
+                    selection_tag = soup.select_one(
+                        ".purchase-page__block.tender-block.purchase-placement .tender-named-values_value"
+                    )
+                    data["type"] = selection_tag.get_text(" ", strip=True) if selection_tag else "--"
+                except:
+                    data["type"] = "--"
+
+                # Описание
+                try:
+                    desc_tag = soup.select_one("div.purchase-description__publication-info")
+                    data["description"] = desc_tag.get_text(" ", strip=True) if desc_tag else "--"
+                except:
+                    data["description"] = "--"
+
+                # Организатор
+                try:
+                    org_tag = soup.select_one("div.lot-customer__info")
+                    data["organizer"] = org_tag.get_text(" ", strip=True) if org_tag else "--"
+                except:
+                    data["organizer"] = "--"
+
+                # Дата публикации
+                try:
+                    pub_tag = soup.select_one("div.purchase-description__publication-info")
+                    if pub_tag:
+                        import re
+                        match = re.search(r"опубликован\s+([\d\.]+\s[\d:]+)", pub_tag.get_text(" ", strip=True))
+                        data["publish_date"] = match.group(1) if match else "--"
+                    else:
+                        data["publish_date"] = "--"
+                except:
+                    data["publish_date"] = "--"
+
+                # Дата окончания
+                try:
+                    date_tag = soup.select_one("span[data-tid='p-date__date']")
+                    data["deadline"] = date_tag.get_text(strip=True) if date_tag else "--"
+                except Exception:
+                    data["deadline"] = "--"
+
+                row = [
+                    data["platform_id"],
+                    platform_z,
+                    data.get("type", "--"),
+                    data.get("selection_method", "--"),
+                    data["name"],
+                    data["description"],
+                    data["organizer"],
+                    data["link"],
+                    data["publish_date"],
+                    data["deadline"],
+                ]
+                try:
+                    sheet_kontur.append_rows([row], value_input_option="RAW")
+                    print("Сохранено:", row)
+                except Exception as e:
+                    print("ERROR APPENDING ROW:", e)
+
+            except Exception as e:
+                print(f"ERROR GETTING DATA FOR LINK {link}: {e}")
 
     finally:
         # обязательно закрываем браузер
