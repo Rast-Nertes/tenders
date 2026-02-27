@@ -15,7 +15,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 
 # -------------------------------
-# Google Sheets helper (очень простой)
+# Google Sheets helper 
 # -------------------------------
 class GoogleSheetClient:
     HEADERS = ["ID тендера", "Название платформы", "Тип торгов", "Способ отбора", "Название", "Описание",
@@ -276,7 +276,7 @@ class B2BScraper:
 
 
 # -------------------------------
-# Утилита: загрузка ключевых слов (как у вас было)
+# Утилита: загрузка ключевых слов 
 # -------------------------------
 def load_keywords(path: str = "../keywords.txt") -> List[str]:
     try:
